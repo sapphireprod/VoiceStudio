@@ -4,9 +4,11 @@ import { takePlaybackKind } from '@/lib/audio/playback-kind';
 import { ProfileAvatar } from '@/components/profile-avatar';
 import { setWorkspace } from '@/lib/store/workspace';
 import { openTake, reuseTake, useSelectedTake } from '@/lib/store/takes';
-import { useVirtualizer } from '@tanstack/react-virtual';
+import { useVirtualizer, type VirtualItem } from '@tanstack/react-virtual';
 import {
+  ArrowDownAZIcon,
   FingerprintIcon,
+  GroupIcon,
   PencilIcon,
   HistoryIcon,
   Redo2Icon,
@@ -18,6 +20,7 @@ import {
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { useTranslation } from 'react-i18next';
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -57,6 +60,86 @@ import {
 
 // ── Saved voices ────────────────────────────────────────────────────────────
 
+type VoiceTags = {
+  src: 'elevenlabs' | 'youtube' | 'own';
+  gender?: string;
+  age?: string;
+  accent?: string;
+  style?: string;
+};
+
+/** Tag segment written into `personality` as `tags: k=v,k=v` (src/gender/age/accent/style),
+ *  with `src:` provenance as fallback. */
+function voiceTags(profile: Profile): VoiceTags {
+  const personality = profile.personality ?? '';
+  const raw: Record<string, string> = {};
+  const seg = personality.match(/tags:\s*([^|]+)/i);
+  if (seg) {
+    for (const kv of seg[1].split(',')) {
+      const [k, v] = kv.split('=').map((s) => s.trim());
+      if (k && v) raw[k.toLowerCase()] = v;
+    }
+  }
+  const src = (raw.src ??
+    (/src:\s*elevenlabs/i.test(personality)
+      ? 'elevenlabs'
+      : /src:\s*youtube/i.test(personality)
+        ? 'youtube'
+        : 'own')) as VoiceTags['src'];
+  return {
+    src,
+    gender: raw.gender,
+    age: raw.age,
+    accent: raw.accent,
+    style: raw.style?.replace(/_/g, ' '),
+  };
+}
+
+const SRC_ORDER: Record<VoiceTags['src'], number> = { own: 0, elevenlabs: 1, youtube: 2 };
+const SRC_LABEL: Record<VoiceTags['src'], string> = {
+  own: 'Your voices',
+  elevenlabs: 'ElevenLabs captures',
+  youtube: 'YouTube captures',
+};
+const SRC_BADGE_CLASS: Record<VoiceTags['src'], string> = {
+  own: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30',
+  elevenlabs: 'bg-sky-500/15 text-sky-400 border-sky-500/30',
+  youtube: 'bg-violet-500/15 text-violet-400 border-violet-500/30',
+};
+
+type SortMode = 'name' | 'source' | 'style';
+
+function VoiceHoverCard({ profile, tags }: { profile: Profile; tags: VoiceTags }) {
+  const chips = [tags.gender, tags.age, tags.accent, tags.style].filter(Boolean) as string[];
+  const summary = (profile.personality ?? '').split('|')[0]?.trim();
+  return (
+    <Card className="pointer-events-none absolute inset-x-1 top-full z-50 mt-1 w-72 gap-2 p-3 shadow-xl ring-1 ring-border/60 backdrop-blur-xl">
+      <div className="flex items-start gap-3">
+        <ProfileAvatar name={profile.name} imageUrl={profile.image_url} className="size-12 shrink-0" />
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-semibold">{profile.name}</p>
+          <Badge
+            variant="outline"
+            className={cn('mt-1 border text-[10px] font-medium uppercase tracking-wide', SRC_BADGE_CLASS[tags.src])}
+          >
+            {SRC_LABEL[tags.src]}
+          </Badge>
+        </div>
+      </div>
+      {chips.length ? (
+        <div className="flex flex-wrap gap-1">
+          {chips.map((chip) => (
+            <Badge key={chip} variant="secondary" className="text-[10px] capitalize">
+              {chip}
+            </Badge>
+          ))}
+        </div>
+      ) : null}
+      {summary ? <p className="line-clamp-3 text-xs leading-relaxed text-muted-foreground">{summary}</p> : null}
+    </Card>
+  );
+}
+
 export function SavedVoices({
   onSelected,
   library = false,
@@ -79,24 +162,53 @@ export function SavedVoices({
   const [pendingDelete, setPendingDelete] = useState<Profile | null>(null);
   const [query, setQuery] = useState('');
   const [kind, setKind] = useState<'all' | Profile['kind']>('all');
+  const [sortMode, setSortMode] = useState<SortMode>('source');
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
 
   const allItems = profiles.data ?? [];
   const items = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
-    return allItems.filter(
+    const filtered = allItems.filter(
       (profile) =>
         (kind === 'all' || profile.kind === kind) &&
         (!normalized ||
-          `${profile.name} ${profile.instruct ?? ''} ${profile.ref_text ?? ''}`
+          `${profile.name} ${profile.instruct ?? ''} ${profile.ref_text ?? ''} ${profile.personality ?? ''}`
             .toLocaleLowerCase()
             .includes(normalized)),
     );
-  }, [allItems, kind, query]);
+    const byName = (a: Profile, b: Profile) => a.name.localeCompare(b.name);
+    if (sortMode === 'name') return filtered.slice().sort(byName);
+    if (sortMode === 'style')
+      return filtered
+        .slice()
+        .sort(
+          (a, b) =>
+            (voiceTags(a).style ?? '').localeCompare(voiceTags(b).style ?? '') || byName(a, b),
+        );
+    return filtered
+      .slice()
+      .sort((a, b) => SRC_ORDER[voiceTags(a).src] - SRC_ORDER[voiceTags(b).src] || byName(a, b));
+  }, [allItems, kind, query, sortMode]);
+  const groups = useMemo(() => {
+    if (sortMode !== 'source') return [{ label: null as string | null, items }];
+    const out: { label: string | null; items: Profile[] }[] = [];
+    for (const profile of items) {
+      const label = SRC_LABEL[voiceTags(profile).src];
+      if (out[out.length - 1]?.label !== label) out.push({ label, items: [] });
+      out[out.length - 1]!.items.push(profile);
+    }
+    return out;
+  }, [items, sortMode]);
   const showLibraryTools = library || allItems.length > 4;
   const hasBothKinds =
     allItems.some((profile) => profile.kind === 'clone') &&
     allItems.some((profile) => profile.kind === 'design');
-  const presentation = profileListPresentation(items.length, library);
+  const presentation =
+    sortMode === 'source'
+      ? library
+        ? 'grid'
+        : 'list'
+      : profileListPresentation(items.length, library);
   const virtualizer = useVirtualizer({
     count: presentation === 'virtual' ? items.length : 0,
     getScrollElement: () => scrollRef?.current ?? null,
@@ -238,6 +350,25 @@ export function SavedVoices({
               </ToggleGroupItem>
             </ToggleGroup>
           ) : null}
+          <ToggleGroup
+            value={[sortMode]}
+            onValueChange={(value) => {
+              const next = value[0];
+              if (next === 'name' || next === 'source' || next === 'style') setSortMode(next);
+            }}
+            size="sm"
+            aria-label="Sort saved voices"
+          >
+            <ToggleGroupItem value="source" aria-label="Group by source" title="Group by source">
+              <GroupIcon />
+            </ToggleGroupItem>
+            <ToggleGroupItem value="name" aria-label="Sort by name" title="Sort by name">
+              <ArrowDownAZIcon />
+            </ToggleGroupItem>
+            <ToggleGroupItem value="style" aria-label="Sort by style" title="Sort by style">
+              <StarIcon />
+            </ToggleGroupItem>
+          </ToggleGroup>
         </div>
       ) : null}
       {items.length === 0 ? (
@@ -245,38 +376,33 @@ export function SavedVoices({
           {t('common.no_matches')}
         </p>
       ) : (
-        <ul
-          className={
+        (() => {
+          const listClass =
             presentation === 'grid'
               ? 'grid grid-cols-[repeat(auto-fill,minmax(min(100%,260px),1fr))] gap-3 p-2'
               : presentation === 'virtual'
                 ? 'relative w-full py-1'
-                : 'flex flex-col gap-0.5 px-2 py-1'
-          }
-          style={
-            presentation === 'virtual' ? { height: virtualizer.getTotalSize() + 8 } : undefined
-          }
-        >
-          {(presentation === 'virtual'
-            ? virtualizer.getVirtualItems().map((row) => ({
-                profile: items[row.index]!,
-                row,
-              }))
-            : items.map((profile) => ({ profile, row: null }))
-          ).map(({ profile, row }) => {
+                : 'flex flex-col gap-0.5 px-2 py-1';
+          const renderItem = (profile: Profile, row: VirtualItem | null) => {
             const design = profile.kind === 'design';
             const active = profile.id === activeId;
+            const tags = voiceTags(profile);
+            const styleChips = [tags.gender, tags.accent, tags.style].filter(Boolean) as string[];
             return (
               <li
                 key={profile.id}
                 className={cn(
-                  'group/profile relative flex items-center gap-2 rounded-lg px-2 transition-[background-color,box-shadow,backdrop-filter] duration-150 hover:bg-sidebar-accent/70 hover:shadow-[inset_0_1px_0_rgb(255_255_255/8%),0_6px_18px_rgb(0_0_0/10%)] hover:ring-1 hover:ring-inset hover:ring-sidebar-border/60 hover:backdrop-blur-xl',
+                  'group/profile relative flex items-center gap-2 rounded-lg px-2 transition-[background-color,box-shadow,backdrop-filter] duration-150 hover:z-20 hover:bg-sidebar-accent/70 hover:shadow-[inset_0_1px_0_rgb(255_255_255/8%),0_6px_18px_rgb(0_0_0/10%)] hover:ring-1 hover:ring-inset hover:ring-sidebar-border/60 hover:backdrop-blur-xl',
                   library ? 'py-3' : 'h-9',
                   row && 'absolute right-2 left-2 top-0',
                   active &&
                     'bg-sidebar-accent/80 shadow-sm ring-1 ring-inset ring-sidebar-border/60',
                 )}
                 style={row ? { transform: `translateY(${row.start + 4}px)` } : undefined}
+                onMouseEnter={() => setHoveredId(profile.id)}
+                onMouseLeave={() => setHoveredId((id) => (id === profile.id ? null : id))}
+                onFocus={() => setHoveredId(profile.id)}
+                onBlur={() => setHoveredId((id) => (id === profile.id ? null : id))}
               >
                 <button
                   type="button"
@@ -306,11 +432,22 @@ export function SavedVoices({
                     </span>
                   </p>
                   {library && (
-                    <p className="mt-0.5 truncate text-xs text-muted-foreground">
-                      {formatRelative(profile.created_at, i18n.language)}
+                    <p className="mt-0.5 flex min-w-0 items-center gap-1 truncate text-xs text-muted-foreground">
+                      {styleChips.length
+                        ? styleChips.map((chip) => (
+                            <Badge
+                              key={chip}
+                              variant="secondary"
+                              className="h-4 px-1 text-[9px] capitalize"
+                            >
+                              {chip}
+                            </Badge>
+                          ))
+                        : formatRelative(profile.created_at, i18n.language)}
                     </p>
                   )}
                 </div>
+                {hoveredId === profile.id ? <VoiceHoverCard profile={profile} tags={tags} /> : null}
                 <div className="absolute right-2 z-20 flex items-center gap-0.5 rounded-md bg-sidebar bg-[linear-gradient(var(--sidebar-accent),var(--sidebar-accent))] p-0.5 opacity-0 shadow-sm ring-1 ring-sidebar-border/50 transition-opacity duration-150 group-hover/profile:opacity-100 group-focus-within/profile:opacity-100">
                   {profile.ref_audio_path ||
                   profile.locked_audio_path ||
@@ -352,8 +489,38 @@ export function SavedVoices({
                 </div>
               </li>
             );
-          })}
-        </ul>
+          };
+          return sortMode === 'source' ? (
+            <div>
+              {groups.map((group) => (
+                <section key={group.label} className="pb-2">
+                  <h3 className="sticky top-[76px] z-10 flex items-baseline justify-between bg-sidebar/95 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-widest text-muted-foreground backdrop-blur-xl">
+                    {group.label}
+                    <span className="font-normal normal-case">{group.items.length}</span>
+                  </h3>
+                  <ul className={listClass}>{group.items.map((p) => renderItem(p, null))}</ul>
+                </section>
+              ))}
+            </div>
+          ) : (
+            <ul
+              className={listClass}
+              style={
+                presentation === 'virtual'
+                  ? { height: virtualizer.getTotalSize() + 8 }
+                  : undefined
+              }
+            >
+              {(presentation === 'virtual'
+                ? virtualizer.getVirtualItems().map((row) => ({
+                    profile: items[row.index]!,
+                    row,
+                  }))
+                : items.map((profile) => ({ profile, row: null }))
+              ).map(({ profile, row }) => renderItem(profile, row))}
+            </ul>
+          );
+        })()
       )}
       <ConfirmDialog
         open={pendingDelete !== null}
